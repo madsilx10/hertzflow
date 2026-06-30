@@ -21,20 +21,36 @@ const ORACLE_URL = "https://oracle-aggregator.hertzflow.xyz/api/v1/latestPrice?g
 const PRIVY_APP_ID = "cmh8y0unk02kdla0cvjk2uk8q";
 const PRIVY_CA_ID = "eb833dff-2ede-4ed2-9061-85e4775514e7";
 
-const USDT_CONTRACT = "0x6335881872FEcab922d1d83c6Bae6E27C5a9209c";
-const REFF_CONTRACT = "0xB7812a1399FA6C9D40966F07F4B8f5C88A319F8D";
-const ROUTER_CONTRACT = "0xc82ceF15311ff3B4a8ab576f43677662378D9F52";
-const VAULT_ROUTER = "0x9A8958B6b3B945C71157E39DE969c95231F83181";
+const USDT_CONTRACT = ethers.getAddress("0x6335881872FEcab922d1d83c6Bae6E27C5a9209c".toLowerCase());
+const REFF_CONTRACT = ethers.getAddress("0xB7812a1399FA6C9D40966F07F4B8f5C88A319F8D".toLowerCase());
+const ROUTER_CONTRACT = ethers.getAddress("0xc82ceF15311ff3B4a8ab576f43677662378D9F52".toLowerCase());
+const VAULT_ROUTER = ethers.getAddress("0x9A8958B6b3B945C71157E39DE969c95231F83181".toLowerCase());
 
-const POOL_FOREX = "0x07860Cc65deb99cb12d4582a7ae8123030c2d5C1"; // USD/TRY
-const POOL_CRYPTO = "0x4cDe676F61dc2f85c83b9404833004b822721c0f"; // BTC/USD
-const VAULT_POOL = "0x02Cf5deF6007e0e247a39571881eda95e0108B29"; // Tech Giants
+const POOL_FOREX = ethers.getAddress("0x07860Cc65deb99cb12d4582a7ae8123030c2d5C1".toLowerCase()); // USD/TRY
+const POOL_CRYPTO = ethers.getAddress("0x4cDe676F61dc2f85c83b9404833004b822721c0f".toLowerCase()); // BTC/USD
+const VAULT_POOL = ethers.getAddress("0x02Cf5deF6007e0e247a39571881eda95e0108B29".toLowerCase()); // Tech Giants
 
 const MARKETS = {
-  "BTC/USD": "0xd537CD7D937446442c62B98c10a9c303152F289a",
+  "BTC/USD": ethers.getAddress("0xd537CD7D937446442c62B98c10a9c303152F289a".toLowerCase()),
 };
-const POOL_FOREX_MARKET = "0xaE2Ba965Cf653631737835c5679f6949D8DB3164";
-const VAULT_MARKET = "0x79Bba0A9Ad45362404173E33d330c5eA6E02EE08";
+const POOL_FOREX_MARKET = ethers.getAddress("0xaE2Ba965Cf653631737835c5679f6949D8DB3164".toLowerCase());
+const VAULT_MARKET = ethers.getAddress("0x79Bba0A9Ad45362404173E33d330c5eA6E02EE08".toLowerCase());
+
+// Daftar pool/vault yang sudah diketahui address-nya.
+// Kalau mau tambah pool/vault lain, tambahkan entry baru di sini
+// (ambil pool address & market address dari tx hash contoh di explorer).
+const KNOWN_POOLS = [
+  { name: "USD/TRY (Forex)", pool: POOL_FOREX, market: POOL_FOREX_MARKET },
+  { name: "BTC/USD (Crypto)", pool: POOL_CRYPTO, market: MARKETS["BTC/USD"] },
+];
+
+const KNOWN_VAULTS = [
+  { name: "Tech Giants", pool: VAULT_POOL, market: VAULT_MARKET },
+];
+
+const KNOWN_MARKETS_LONGSHORT = [
+  { name: "BTC/USD", market: MARKETS["BTC/USD"] },
+];
 
 let REFERRAL_CODE = "TENXZC";
 
@@ -93,14 +109,25 @@ function loadWallets(path = "wallets.txt") {
   }
   const lines = fs.readFileSync(path, "utf-8").split("\n");
   const wallets = [];
-  for (let line of lines) {
-    line = line.trim();
-    if (!line || line.startsWith("#")) continue;
+  for (let raw of lines) {
+    let line = raw.trim();
+    if (!line) continue;
+    if (line.startsWith("#") || line.startsWith("//")) continue;
+
+    // bersihin format umum: KEY=0x..., "0x...", '0x...'
+    if (line.includes("=")) {
+      line = line.split("=").pop().trim();
+    }
+    line = line.replace(/["']/g, "").trim();
+
+    if (!line.startsWith("0x")) line = "0x" + line;
+    if (line.length !== 66) continue; // 0x + 64 hex char
+
     try {
       const w = new ethers.Wallet(line, provider);
       wallets.push(w);
     } catch (e) {
-      console.log(`[WARN] Private key invalid: ${line.slice(0, 10)}...`);
+      console.log(`[WARN] Private key invalid (skip baris): ${line.slice(0, 12)}...`);
     }
   }
   return wallets;
@@ -290,6 +317,24 @@ async function getBtcPrice() {
   return { min: fallback, max: (fallback * 1001n) / 1000n };
 }
 
+async function simulateOrThrow(wallet, txReq, ifaceForError) {
+  try {
+    await provider.call({ ...txReq, from: wallet.address });
+  } catch (e) {
+    let decoded = null;
+    const errData = e.data || (e.info && e.info.error && e.info.error.data) || null;
+    if (errData && ifaceForError) {
+      try {
+        decoded = ifaceForError.parseError(errData);
+      } catch (_) {}
+    }
+    if (decoded) {
+      throw new Error(`Revert: ${decoded.name}(${decoded.args.map(String).join(", ")})`);
+    }
+    throw new Error(`Revert raw: ${errData || e.shortMessage || e.message}`);
+  }
+}
+
 // ─── LONG / SHORT (multicall) ──────────────────────────────────────────────
 // CATATAN: struct createOrder direkonstruksi dari pola tx, belum 100% exact match.
 // Kalau revert, perlu re-verify offset struct dari raw input data tx asli.
@@ -298,22 +343,21 @@ const ROUTER_IFACE = new ethers.Interface([
   "function multicall(bytes[] data) payable returns (bytes[])",
   "function sendWnt(address receiver, uint256 amount) payable",
   "function sendTokens(address token, address receiver, uint256 amount)",
-  "function createOrder((bytes32 referralCode,(address receiver,address callbackContract,address uiFeeReceiver,address market,address initialCollateralToken,address[] swapPath) addresses,(uint256 sizeDeltaUsd,uint256 initialCollateralDeltaAmount,uint256 triggerPrice,uint256 acceptablePrice,uint256 executionFee,uint256 callbackGasLimit,uint256 minOutputAmount,uint256 validFromTime) numbers,uint8 orderType,uint8 decreasePositionSwapType,bool isLong,bool shouldUnwrapNativeToken,bool autoCancel) params) payable returns (bytes32)",
+  "function createOrder(tuple(bytes32 referralCode, tuple(address receiver, address callbackContract, address uiFeeReceiver, address market, address initialCollateralToken, address[] swapPath) addresses, tuple(uint256 sizeDeltaUsd, uint256 initialCollateralDeltaAmount, uint256 triggerPrice, uint256 acceptablePrice, uint256 executionFee, uint256 callbackGasLimit, uint256 minOutputAmount, uint256 validFromTime) numbers, uint8 orderType, uint8 decreasePositionSwapType, bool isLong, bool shouldUnwrapNativeToken, bool autoCancel) params) payable returns (bytes32)",
 ]);
 
-async function doLongShort(wallet, isLong, amountUsdt) {
+async function doLongShort(wallet, isLong, amountUsdt, marketInfo) {
   const address = wallet.address;
   const dirLabel = isLong ? "LONG" : "SHORT";
-  log(address, `Open ${dirLabel} BTC/USD | amount: ${amountUsdt} USDT`);
+  const marketAddr = marketInfo.market;
+  log(address, `Open ${dirLabel} ${marketInfo.name} | amount: ${amountUsdt} USDT`);
 
   const { min, max } = await getBtcPrice();
   if (min === 0n) {
-    log(address, "Gagal dapat harga BTC", "ERR");
-    return false;
+    log(address, "Gagal dapat harga, pakai estimasi", "WARN");
   }
 
   const collateralWei = ethers.parseUnits(amountUsdt.toString(), 18);
-  const marketAddr = MARKETS["BTC/USD"];
   const execFee = ethers.parseEther("0.006");
 
   await approveUsdt(wallet, ROUTER_CONTRACT, collateralWei * 2n);
@@ -360,12 +404,14 @@ async function doLongShort(wallet, isLong, amountUsdt) {
   const multicallData = ROUTER_IFACE.encodeFunctionData("multicall", [[wrapData, sendData, createData]]);
 
   try {
-    const tx = await wallet.sendTransaction({
+    const txReq = {
       to: ROUTER_CONTRACT,
       data: multicallData,
       value: execFee,
       gasLimit: 2000000,
-    });
+    };
+    await simulateOrThrow(wallet, txReq, ROUTER_IFACE);
+    const tx = await wallet.sendTransaction(txReq);
     log(address, `${dirLabel} tx: ${tx.hash}`);
     const receipt = await tx.wait();
     if (receipt.status === 1) {
@@ -387,14 +433,14 @@ const POOL_IFACE = new ethers.Interface([
   "function multicall(bytes[] data) payable returns (bytes[])",
   "function sendWnt(address receiver, uint256 amount) payable",
   "function sendTokens(address token, address receiver, uint256 amount)",
-  "function createDeposit((address receiver,address callbackContract,address uiFeeReceiver,address market,address initialLongToken,address initialShortToken,address[] longTokenSwapPath,address[] shortTokenSwapPath) addresses,uint256 minMarketTokens,bool shouldUnwrapNativeToken,uint256 executionFee,uint256 callbackGasLimit) params) payable returns (bytes32)",
+  "function createDeposit(tuple(tuple(address receiver, address callbackContract, address uiFeeReceiver, address market, address initialLongToken, address initialShortToken, address[] longTokenSwapPath, address[] shortTokenSwapPath) addresses, uint256 minMarketTokens, bool shouldUnwrapNativeToken, uint256 executionFee, uint256 callbackGasLimit) params) payable returns (bytes32)",
 ]);
 
-async function doPool(wallet, amountUsdt, poolType) {
+async function doPool(wallet, amountUsdt, poolInfo) {
   const address = wallet.address;
-  const poolAddr = poolType === "forex" ? POOL_FOREX : POOL_CRYPTO;
-  const poolName = poolType === "forex" ? "USD/TRY (Forex)" : "BTC/USD (Crypto)";
-  const marketAddr = poolType === "forex" ? POOL_FOREX_MARKET : MARKETS["BTC/USD"];
+  const poolAddr = poolInfo.pool;
+  const poolName = poolInfo.name;
+  const marketAddr = poolInfo.market;
 
   log(address, `Add Liquidity Pool ${poolName} | ${amountUsdt} USDT`);
 
@@ -423,12 +469,14 @@ async function doPool(wallet, amountUsdt, poolType) {
   const multicallData = POOL_IFACE.encodeFunctionData("multicall", [[wrapData, sendData, createData]]);
 
   try {
-    const tx = await wallet.sendTransaction({
+    const txReq = {
       to: ROUTER_CONTRACT,
       data: multicallData,
       value: execFee,
       gasLimit: 2000000,
-    });
+    };
+    await simulateOrThrow(wallet, txReq, POOL_IFACE);
+    const tx = await wallet.sendTransaction(txReq);
     log(address, `Pool tx: ${tx.hash}`);
     const receipt = await tx.wait();
     if (receipt.status === 1) {
@@ -450,12 +498,12 @@ const VAULT_IFACE = new ethers.Interface([
   "function multicall(bytes[] data) payable returns (bytes[])",
   "function sendWnt(address receiver, uint256 amount) payable",
   "function sendTokens(address token, address receiver, uint256 amount)",
-  "function createDeposit((address receiver,address callbackContract,address uiFeeReceiver,address market,address initialLongToken,address initialShortToken,address[] longTokenSwapPath,address[] shortTokenSwapPath) addresses,uint256 minMarketTokens,bool shouldUnwrapNativeToken,uint256 executionFee,uint256 callbackGasLimit) params) payable returns (bytes32)",
+  "function createDeposit(tuple(tuple(address receiver, address callbackContract, address uiFeeReceiver, address market, address initialLongToken, address initialShortToken, address[] longTokenSwapPath, address[] shortTokenSwapPath) addresses, uint256 minMarketTokens, bool shouldUnwrapNativeToken, uint256 executionFee, uint256 callbackGasLimit) params) payable returns (bytes32)",
 ]);
 
-async function doVault(wallet, amountUsdt) {
+async function doVault(wallet, amountUsdt, vaultInfo) {
   const address = wallet.address;
-  log(address, `Deposit Vault Tech Giants | ${amountUsdt} USDT`);
+  log(address, `Deposit Vault ${vaultInfo.name} | ${amountUsdt} USDT`);
 
   const amountWei = ethers.parseUnits(amountUsdt.toString(), 18);
   const execFee = ethers.parseEther("0.008");
@@ -466,15 +514,15 @@ async function doVault(wallet, amountUsdt) {
     receiver: address,
     callbackContract: ethers.ZeroAddress,
     uiFeeReceiver: ethers.ZeroAddress,
-    market: VAULT_MARKET,
+    market: vaultInfo.market,
     initialLongToken: USDT_CONTRACT,
     initialShortToken: USDT_CONTRACT,
     longTokenSwapPath: [],
     shortTokenSwapPath: [],
   };
 
-  const wrapData = VAULT_IFACE.encodeFunctionData("sendWnt", [VAULT_POOL, execFee]);
-  const sendData = VAULT_IFACE.encodeFunctionData("sendTokens", [USDT_CONTRACT, VAULT_POOL, amountWei]);
+  const wrapData = VAULT_IFACE.encodeFunctionData("sendWnt", [vaultInfo.pool, execFee]);
+  const sendData = VAULT_IFACE.encodeFunctionData("sendTokens", [USDT_CONTRACT, vaultInfo.pool, amountWei]);
   const createData = VAULT_IFACE.encodeFunctionData("createDeposit", [
     [depositParams, 0n, false, execFee, 0n],
   ]);
@@ -482,12 +530,14 @@ async function doVault(wallet, amountUsdt) {
   const multicallData = VAULT_IFACE.encodeFunctionData("multicall", [[wrapData, sendData, createData]]);
 
   try {
-    const tx = await wallet.sendTransaction({
+    const txReq = {
       to: VAULT_ROUTER,
       data: multicallData,
       value: execFee,
       gasLimit: 2000000,
-    });
+    };
+    await simulateOrThrow(wallet, txReq, VAULT_IFACE);
+    const tx = await wallet.sendTransaction(txReq);
     log(address, `Vault tx: ${tx.hash}`);
     const receipt = await tx.wait();
     if (receipt.status === 1) {
@@ -566,11 +616,16 @@ async function selectAccounts(wallets) {
   console.log("  1. Satu akun (pilih nomor)");
   console.log("  2. Semua akun");
   console.log("  3. From X to end");
-  const choice = await ask("Pilihan (1/2/3): ");
+  console.log("  4. Lihat daftar address");
+  let choice = await ask("Pilihan (1/2/3/4): ");
+
+  if (choice === "4") {
+    wallets.forEach((w, i) => console.log(`  [${i + 1}] ${w.address}`));
+    choice = await ask("\nPilihan (1/2/3): ");
+  }
 
   if (choice === "1") {
-    wallets.forEach((w, i) => console.log(`  [${i + 1}] ${w.address}`));
-    const idx = parseInt(await ask("Nomor akun: ")) - 1;
+    const idx = parseInt(await ask("Nomor akun (cek opsi 4 dulu kalau lupa urutan): ")) - 1;
     return [wallets[idx]];
   } else if (choice === "2") {
     return wallets;
@@ -580,6 +635,24 @@ async function selectAccounts(wallets) {
   } else {
     console.log("Input invalid");
     process.exit(1);
+  }
+}
+
+async function selectFromList(list, label) {
+  console.log(`\nPilih ${label}:`);
+  list.forEach((item, i) => console.log(`  ${i + 1}. ${item.name}`));
+  console.log(`  ${list.length + 1}. Custom address (manual)`);
+  const choice = parseInt(await ask("Pilihan: "));
+
+  if (choice >= 1 && choice <= list.length) {
+    return list[choice - 1];
+  } else {
+    const poolRaw = await ask("Pool/Market address: ");
+    const marketRaw = await ask("Market address (kosongkan kalau sama dengan pool): ");
+    const name = await ask("Nama (buat label log): ");
+    const pool = ethers.getAddress(poolRaw.trim().toLowerCase());
+    const market = marketRaw.trim() ? ethers.getAddress(marketRaw.trim().toLowerCase()) : pool;
+    return { name, pool, market };
   }
 }
 
@@ -602,18 +675,12 @@ async function selectMode() {
   return modes[choice] || "balance";
 }
 
-async function runWallet(wallet, mode) {
+async function runWallet(wallet, mode, opts) {
   const address = wallet.address;
 
   if (mode === "balance") {
     await doBalance(wallet);
     return;
-  }
-
-  if (mode === "faucet" || mode === "all") {
-    log(address, "=== FAUCET ===");
-    await doFaucet(wallet);
-    await sleep(3000);
   }
 
   if (mode === "bind_reff" || mode === "all") {
@@ -622,28 +689,33 @@ async function runWallet(wallet, mode) {
     await sleep(3000);
   }
 
+  if (mode === "faucet" || mode === "all") {
+    log(address, "=== FAUCET ===");
+    await doFaucet(wallet);
+    await sleep(3000);
+  }
+
   if (mode === "long" || mode === "all") {
     log(address, "=== LONG ===");
-    await doLongShort(wallet, true, Math.round(randRange(5, 15) * 100) / 100);
+    await doLongShort(wallet, true, Math.round(randRange(5, 15) * 100) / 100, opts.market);
     await sleep(5000);
   }
 
   if (mode === "short" || mode === "all") {
     log(address, "=== SHORT ===");
-    await doLongShort(wallet, false, Math.round(randRange(5, 15) * 100) / 100);
+    await doLongShort(wallet, false, Math.round(randRange(5, 15) * 100) / 100, opts.market);
     await sleep(5000);
   }
 
   if (mode === "pool" || mode === "all") {
     log(address, "=== POOL ===");
-    const poolType = Math.random() < 0.5 ? "forex" : "crypto";
-    await doPool(wallet, Math.round(randRange(10, 25) * 100) / 100, poolType);
+    await doPool(wallet, Math.round(randRange(10, 25) * 100) / 100, opts.pool);
     await sleep(5000);
   }
 
   if (mode === "vault" || mode === "all") {
     log(address, "=== VAULT ===");
-    await doVault(wallet, Math.round(randRange(10, 30) * 100) / 100);
+    await doVault(wallet, Math.round(randRange(10, 30) * 100) / 100, opts.vault);
     await sleep(3000);
   }
 }
@@ -660,6 +732,17 @@ async function main() {
   const selected = await selectAccounts(wallets);
   const mode = await selectMode();
 
+  const opts = {};
+  if (mode === "long" || mode === "short" || mode === "all") {
+    opts.market = await selectFromList(KNOWN_MARKETS_LONGSHORT, "market untuk Long/Short");
+  }
+  if (mode === "pool" || mode === "all") {
+    opts.pool = await selectFromList(KNOWN_POOLS, "pool untuk farming");
+  }
+  if (mode === "vault" || mode === "all") {
+    opts.vault = await selectFromList(KNOWN_VAULTS, "vault untuk deposit");
+  }
+
   console.log(`\nMode: ${mode.toUpperCase()} | Akun: ${selected.length}`);
   console.log("-".repeat(50));
 
@@ -667,7 +750,7 @@ async function main() {
     const wallet = selected[i];
     console.log(`\n[${i + 1}/${selected.length}] Processing ${wallet.address}`);
     try {
-      await runWallet(wallet, mode);
+      await runWallet(wallet, mode, opts);
     } catch (e) {
       log(wallet.address, `Error: ${e.message}`, "ERR");
       console.error(e);
